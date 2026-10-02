@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+
+# Local runtime data (Loki/Grafana volumes, Nomad data dir)
+loki-data/
+grafana-data/
+nomad-data/
+
+# Local environment overrides
+.env
+*.local
+
+# Logs
+*.log
