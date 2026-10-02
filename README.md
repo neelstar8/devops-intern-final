@@ -651,4 +651,115 @@ configuration.
 
 ## Git workflow evidence
 
-Placeholder — filled in after the pull request is merged and tagged.
+All of the following was actually executed; outputs are copied verbatim.
+
+### Branch and commits
+
+Nine commits on `feature/devops-assessment`, conventional prefixes
+(`chore:`, `feat:`, `ci:`, `fix:`, `docs:`), no single giant commit:
+
+```
+$ git log --oneline
+726cb59 Merge pull request #1 from neelstar8/feature/devops-assessment
+3fbca55 docs: keep screenshots directory in version control
+9373994 docs: add assessment documentation
+5751835 feat: add loki monitoring stack
+316bf43 fix: resolve nomad job validation warning
+66f625e feat: add nomad deployment
+90f9b74 ci: add github actions pipeline
+97551b9 feat: add system information and healthcheck scripts
+e029b0b feat: add docker configuration
+fa0ee55 feat: add nginx application
+8791684 chore: initialize repository with gitignore
+```
+
+### Pull request, self-review and merge
+
+- PR: https://github.com/neelstar8/devops-intern-final/pull/1
+- Self-review posted as a review on that PR (`neelstar8: COMMENTED`), covering
+  each file plus the two gaps being knowingly merged.
+
+```
+$ gh pr view 1 --json state,mergedAt,mergeCommit
+state=MERGED  mergedAt=2026-10-02T17:03:01Z
+mergeCommit=726cb59a795eb1504cdef96e5ab9ed1fd2d0a979
+```
+
+Three CI runs on the PR, all green, with `publish` skipped every time:
+
+```
+$ gh run list --branch feature/devops-assessment --limit 3
+completed  success  CI  feature/devops-assessment  pull_request  37037928167  39s
+completed  success  CI  feature/devops-assessment  pull_request  37037893837  46s
+completed  success  CI  feature/devops-assessment  pull_request  37036330285  49s
+```
+
+### CI on `main` — observed
+
+```
+$ gh run view 37038074339
+✓ main CI · 37038074339
+Triggered via push
+
+JOBS
+✓ Lint (ShellCheck + Hadolint) in 8s (ID 110941103936)
+✓ Build image in 19s (ID 110941169458)
+✓ Test container health in 12s (ID 110941306785)
+✓ Publish to GHCR in 17s (ID 110941401631)
+```
+
+All four jobs green. `publish` ran this time because the trigger was a push
+to `main`.
+
+### GHCR publication — observed
+
+From the `publish` job log:
+
+```
+Login Succeeded
+726cb59a795eb1504cdef96e5ab9ed1fd2d0a979: digest: sha256:2e2e4aeda5e34622b6627d0dc654c1d4acab509f554d71e944102ac04bbfa612 size: 2398
+latest: digest: sha256:2e2e4aeda5e34622b6627d0dc654c1d4acab509f554d71e944102ac04bbfa612 size: 2398
+```
+
+Confirmed independently against the registry, unauthenticated:
+
+```
+$ curl -s -H "Authorization: Bearer $TOK" \
+    https://ghcr.io/v2/neelstar8/devops-intern-final/tags/list
+{"name":"neelstar8/devops-intern-final","tags":["726cb59a795eb1504cdef96e5ab9ed1fd2d0a979","latest"]}
+```
+
+Both tags exist and point at the same digest. The image is:
+
+```
+ghcr.io/neelstar8/devops-intern-final:latest
+ghcr.io/neelstar8/devops-intern-final:726cb59a795eb1504cdef96e5ab9ed1fd2d0a979
+```
+
+`BUILD_SHA` was passed as `726cb59a795eb1504cdef96e5ab9ed1fd2d0a979`, so the
+published page renders that commit SHA as its build identifier.
+
+### `main` contains the completed project — observed
+
+```
+$ git checkout main && git pull && ls -A
+.github  .gitignore  README.md  app  docker-compose.yaml
+docs  loki_setup.md  monitoring  nomad  scripts
+
+$ git rev-parse main
+726cb59a795eb1504cdef96e5ab9ed1fd2d0a979
+```
+
+### Release tag
+
+The annotated tag `v1.0.0` is created on `main` after this documentation is
+merged, so it points at the final submission state:
+
+```sh
+git checkout main && git pull
+git tag -a v1.0.0 -m "DevOps Intern Final Assessment submission"
+git push origin v1.0.0
+```
+
+Verify with `git show v1.0.0 --stat` or
+https://github.com/neelstar8/devops-intern-final/releases/tag/v1.0.0
