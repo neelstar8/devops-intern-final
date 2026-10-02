@@ -14,6 +14,9 @@ job "nginx-app" {
   group "web" {
     count = 1
 
+    # Keep serving in-flight requests while Consul deregisters the service.
+    shutdown_delay = "5s"
+
     # Nomad picks a free host port and exposes it as NOMAD_PORT_http.
     network {
       port "http" {
