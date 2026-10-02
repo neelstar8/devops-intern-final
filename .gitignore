@@ -17,3 +17,6 @@ nomad-data/
 
 # Logs
 *.log
+
+# Local-only compose override (port conflicts etc.)
+docker-compose.override.yaml

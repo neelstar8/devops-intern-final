@@ -10,10 +10,11 @@ An end-to-end deployment pipeline for a containerized NGINX web application:
 source control → CI → image registry → Nomad → logging and dashboards.
 
 > **Verification status.** Every command output in this README was actually
-> run on the machine described under [Prerequisites](#prerequisites). Anything
-> that could not be executed is labelled **NOT VERIFIED** with the reason.
-> Nothing in this document is invented. See
-> [Known Limitations](#known-limitations) for the summary.
+> run on the machine described under [Prerequisites](#prerequisites). All seven
+> tasks are verified end to end: the image CI published to GHCR was deployed by
+> Nomad, health-checked by Consul, and its access logs were queried in Grafana
+> via Loki. Nothing in this document is invented. See
+> [Known Limitations](#known-limitations).
 
 ---
 
@@ -444,29 +445,72 @@ CPU         Memory      Disk         Alloc Count
 
 Driver status on the node: `docker,java,raw_exec`.
 
-### `nomad job run` and healthy allocation status
+### `nomad job run` — observed
 
-**NOT VERIFIED — the local Docker daemon cannot start containers on this
-machine.** Nomad and Consul are installed and running, `validate` and `plan`
-both succeed, and the scheduler confirms the allocation can be placed. But
-`nomad job run` would hand the container to Docker, and Docker container
-startup is currently broken here for the memory reason documented in
-Troubleshooting item 5. Submitting the job would produce a failed allocation
-for reasons unrelated to the job specification, so it was not run and no
-allocation output is shown.
+Run against the image published to GHCR by CI:
 
-To finish this step once Docker is healthy:
-
-```sh
-consul agent -dev -client=127.0.0.1 &
-nomad agent -dev -bind=127.0.0.1 -config=nomad-dev.hcl &
-nomad job run -var="image_tag=latest" nomad/nginx-app.nomad.hcl
-nomad job status nginx-app          # expect Status = running, 1 running alloc
-nomad alloc status <alloc-id>       # expect Tasks "nginx" state = running
-consul members                      # expect the node alive
-curl -s http://localhost:8500/v1/health/checks/nginx-app | jq '.[].Status'
-                                    # expect "passing"
 ```
+$ nomad job run -var="image_tag=latest" nomad/nginx-app.nomad.hcl
+ID          = c3f5a1ee
+Job ID      = nginx-app
+Status      = successful
+Description = Deployment completed successfully
+
+Deployed
+Task Group  Auto Revert  Desired  Placed  Healthy  Unhealthy  Progress Deadline
+web         true         1        1       1        0          2026-10-02T23:04:41+05:30
+```
+
+### Healthy job status — observed
+
+```
+$ nomad job status nginx-app
+ID            = nginx-app
+Type          = service
+Status        = running
+
+Summary
+Task Group  Queued  Starting  Running  Failed  Complete  Lost  Unknown
+web         0       0         1        0       0         0     0
+
+Latest Deployment
+ID          = c3f5a1ee
+Status      = successful
+Description = Deployment completed successfully
+
+Allocations
+ID        Node ID   Task Group  Version  Desired  Status   Created  Modified
+cc4ccbb9  38e31479  web         0        run      running  28s ago  8s ago
+```
+
+### Consul health check — observed
+
+```
+$ consul members
+Node         Address         Status  Type    Build  Protocol  DC
+Mac-2.local  127.0.0.1:8301  alive   server  2.0.4  2         dc1
+
+$ curl -s http://localhost:8500/v1/health/checks/nginx-app | jq -c '.[]|{Name,Status,Output}'
+{"Name":"service: \"nginx-app\" check","Status":"passing",
+ "Output":"HTTP GET http://127.0.0.1:29505/healthz: 200 OK Output: ok\n"}
+```
+
+The check is **passing**. Nomad allocated the dynamic host port `29505` and
+mapped it to container port 8080, exactly as the `network` stanza specifies.
+
+### Serving the published GHCR image — observed
+
+```
+$ curl -s http://127.0.0.1:29505/ | grep -A1 'BUILD_SHA'
+      <dt>Build identifier (BUILD_SHA)</dt>
+      <dd>e1bf3a01f00c85c8310c616501a343a2d1759cdd</dd>
+
+$ curl -s -o /dev/null -w 'healthz HTTP %{http_code}\n' http://127.0.0.1:29505/healthz
+healthz HTTP 200
+```
+
+The page renders commit `e1bf3a0`, confirming the running container is the
+image CI built and pushed to GHCR, not a local build.
 
 ---
 
@@ -489,19 +533,45 @@ Intended query, after requesting `/this-path-does-not-exist`:
 {container="nginx-app"} | json | status != 200
 ```
 
-### Status: PARTIALLY VERIFIED
+### Status: VERIFIED
 
 | Item | Status |
 | --- | --- |
 | Configs written and YAML-valid | **PASS** |
-| Loki / Promtail / Grafana images pull | **PASS** |
-| Containers running | **NOT VERIFIED** — Docker cannot start containers (Troubleshooting 5) |
-| Loki ingestion proven | **NOT VERIFIED** |
-| LogQL non-200 query result | **NOT VERIFIED** |
-| Grafana Explore screenshot | **NOT CAPTURED** — `docs/screenshots/` is empty |
+| Loki / Promtail / Grafana running | **PASS** |
+| Loki ingestion proven | **PASS** |
+| Labels `job`, `container`, `service`, `nomad_alloc_id` | **PASS** |
+| LogQL isolates non-200 responses | **PASS** |
+| Grafana Explore screenshot | **PASS** |
 
-No Loki output or Grafana screenshot is shown here because none was produced.
-The remaining steps are listed in `loki_setup.md`.
+Observed non-200 query result:
+
+```
+$ curl -sG http://localhost:3100/loki/api/v1/query_range \
+    --data-urlencode 'query={container="nginx-app"} | json | status != 200' ...
+
+stream labels: {"container":"nginx-app","job":"docker","service":"nginx-app"}
+  {"time":"2026-10-02T17:23:33+00:00","remote_addr":"192.168.65.1","method":"GET",
+   "path":"/this-path-does-not-exist","status":404,"body_bytes":153,"user_agent":"curl/8.7.1"}
+stream labels: {"container":"nginx-app","job":"docker","service":"nginx-app"}
+  {"time":"2026-10-02T17:23:33+00:00","remote_addr":"192.168.65.1","method":"GET",
+   "path":"/another-missing-page","status":404,"body_bytes":153,"user_agent":"curl/8.7.1"}
+```
+
+Logs from the Nomad allocation carry the alloc id, proving the whole chain:
+
+```
+labels: {"container":"nginx-cc4ccbb9-f82a-a811-5db5-a7d5e285c781","job":"docker",
+         "nomad_alloc_id":"cc4ccbb9-f82a-a811-5db5-a7d5e285c781"}
+  {"time":"2026-10-02T17:24:58+00:00","method":"GET",
+   "path":"/this-path-does-not-exist","status":404,...}
+```
+
+### Grafana Explore screenshot
+
+![Grafana Explore showing non-200 NGINX access logs from Loki](docs/screenshots/grafana-explore-non200.jpg)
+
+Saved at `docs/screenshots/grafana-explore-non200.jpg`.
 
 ---
 
@@ -617,35 +687,84 @@ PhysMem: 15G used (2097M wired, 4743M compressor), 141M unused.
 
 A 16 GB host with ~141 MB unused and 4.7 GB compressed is swapping hard. The
 Docker VM could not get the 8.2 GB it was promised, so `containers/<id>/start`
-died mid-request. Quitting and relaunching Docker Desktop did **not** fix it,
-which ruled out a transient daemon fault. Image *pulls* kept working, ruling
-out config and registry problems.
+died mid-request. Relaunching Docker Desktop did **not** help, ruling out a
+transient daemon fault; image *pulls* kept working, ruling out config and
+registry problems.
 
-**Fix: identified, not yet applied.** Free host memory, then lower Docker
-Desktop's memory limit (Settings → Resources) to around 4 GB — plenty for this
-stack — and retry. This is what blocks the remaining Task 5 and Task 6
-verification; it is an environment issue, not a defect in the committed
-configuration.
+**Fix:** capped the Docker Desktop VM at 4 GB (Settings → Resources → Memory,
+`MemoryMiB`) and restarted it — counter-intuitive, but asking the host for
+less memory is what let the VM actually run:
+
+```
+$ docker info --format 'VM memory: {{.MemTotal}} bytes'
+VM memory: 4108943360 bytes
+
+$ docker run -d --name nginx-app ... && docker ps
+nginx-app   Up 8 seconds (healthy)
+```
+
+Every container started normally afterwards, which unblocked Tasks 5 and 6.
+
+### 6. Grafana could not bind port 3000
+
+```
+Error response from daemon: ports are not available: exposing port TCP
+0.0.0.0:3000 -> 127.0.0.1:0: listen tcp 0.0.0.0:3000: bind: address already in use
+
+$ lsof -nP -iTCP:3000 -sTCP:LISTEN
+node    44492 neel   17u  IPv6 ... TCP *:3000 (LISTEN)
+```
+
+An unrelated Node app on this machine owns port 3000.
+
+**Fix:** `docker-compose.yaml` keeps the conventional `3000:3000`, because a
+reviewer's machine will normally have it free. Locally an uncommitted,
+gitignored `docker-compose.override.yaml` remaps it to 3001.
+
+The first attempt at that override silently failed: Compose **merges** list
+fields, so it appended `3001:3000` to the existing mapping and the conflict
+remained. The `!override` tag replaces the list instead:
+
+```yaml
+services:
+  grafana:
+    ports: !override
+      - "3001:3000"
+```
+
+### 7. Nomad could not pull the image before it was published
+
+Not a failure so much as an ordering constraint worth recording: the Nomad job
+references `ghcr.io/neelstar8/devops-intern-final:${var.image_tag}`, so it
+cannot run until CI has pushed that image. `nomad job run` was therefore
+deliberately deferred until after PR #1 merged and the `publish` job succeeded.
+`validate` and `plan` need no registry access and were run earlier.
 
 ---
 
 ## Known Limitations
 
-1. **Loki ingestion is not proven.** Configs are complete and YAML-valid, and
-   the images pull, but no container ever started, so no LogQL result exists.
-2. **No Grafana screenshot.** `docs/screenshots/` is empty. Fabricating one
-   was not an option.
-3. **`nomad job run` was never executed.** `validate` and `plan` pass against
-   a live agent with the Docker driver detected, but running the job depends
-   on the same broken Docker startup.
-4. **Nomad on Apple Silicon needs an uncommitted agent override**
-   (`cpu_total_compute`). Not needed on Linux.
-5. **`pipefail` is conditional**, because it is not POSIX. See Task 2.
-6. **Grafana runs with anonymous admin access** so a reviewer can open Explore
+1. **Nomad on Apple Silicon needs an uncommitted agent override.** Nomad
+   fingerprints only ~28 MHz of CPU on this hardware, so a local
+   `cpu_total_compute` override is required for the spec-mandated `cpu = 100`
+   to be placeable. Not needed on Linux. See Troubleshooting 3.
+2. **Grafana port 3000 is remapped locally** via an uncommitted
+   `docker-compose.override.yaml`, because another app owns 3000 on this
+   machine. The committed compose file uses the conventional 3000.
+3. **`pipefail` is enabled conditionally**, because it is not POSIX. See
+   Task 2.
+4. **Grafana runs with anonymous admin access** so a reviewer can open Explore
    without credentials. Local convenience only; not a production setting.
-7. **The Nomad job hardcodes the GHCR registry path.** Only the tag is
+5. **Loki stores data on the container filesystem** with no persistent volume,
+   so logs are lost when the stack is torn down. Adequate for an assessment,
+   not for anything real.
+6. **The Nomad job hardcodes the GHCR registry path.** Only the tag is
    parameterized, which is what the assessment asked for.
+7. **Single-node everything.** Nomad and Consul both run in `-dev` mode, which
+   means one server, no replication, and in-memory state.
 8. **Verified on macOS/arm64 only.** CI covers `ubuntu-latest`.
+9. **The Docker Desktop memory limit was changed to 4 GB** on this machine to
+   make the stack runnable. That is a host setting, not part of the repo.
 
 ---
 
