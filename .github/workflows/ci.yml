@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege by default; only the publish job widens this.
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  lint:
+    name: Lint (ShellCheck + Hadolint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: shellcheck -s sh scripts/sysinfo.sh scripts/healthcheck.sh
+
+      - name: Hadolint
+        run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint - < app/Dockerfile
+
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with BUILD_SHA
+        run: |
+          docker build \
+            --build-arg BUILD_SHA=${{ github.sha }} \
+            -t app:ci \
+            app/
+
+      - name: Report image size
+        run: docker images app:ci
+
+      # Hand the exact built image to the test job instead of rebuilding it.
+      - name: Save image
+        run: docker save app:ci -o image.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-image
+          path: image.tar
+          retention-days: 1
+
+  test:
+    name: Test container health
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-image
+
+      - name: Load image
+        run: docker load -i image.tar
+
+      - name: Start container
+        run: docker run -d --name nginx-app -p 8080:8080 app:ci
+
+      - name: Wait for readiness
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then
+              echo "ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "container did not become ready in 30s"
+          docker logs nginx-app
+          exit 1
+
+      - name: Run healthcheck script
+        run: ./scripts/healthcheck.sh http://localhost:8080
+
+      - name: Verify homepage returns HTTP 200
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/)
+          echo "GET / -> HTTP ${status}"
+          test "${status}" = "200"
+
+      - name: Show container logs
+        if: always()
+        run: docker logs nginx-app
+
+  publish:
+    name: Publish to GHCR
+    runs-on: ubuntu-latest
+    needs: test
+    # Only publish real builds of main, never pull requests.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # GITHUB_TOKEN is short-lived and scoped to this run; no stored secrets.
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push (commit SHA + latest)
+        run: |
+          docker build \
+            --build-arg BUILD_SHA=${{ github.sha }} \
+            -t ${{ env.IMAGE }}:${{ github.sha }} \
+            -t ${{ env.IMAGE }}:latest \
+            app/
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:latest
